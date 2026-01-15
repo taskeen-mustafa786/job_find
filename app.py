@@ -1,144 +1,179 @@
 import streamlit as st
 import requests
 import pdfplumber
-import spacy
 import re
 import urllib.parse
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-# ---------------- CONFIG ----------------
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
 st.set_page_config(page_title="Live Job Finder", layout="wide")
-nlp = spacy.load("en_core_web_sm")
 
 COMMON_SKILLS = [
     "python", "java", "javascript", "react", "django", "fastapi",
-    "machine learning", "deep learning", "sql", "mongodb", "node"
+    "machine learning", "data science", "sql", "mongodb", "node"
 ]
 
-# ---------------- FUNCTIONS ----------------
+if "bookmarks" not in st.session_state:
+    st.session_state.bookmarks = []
+
+# --------------------------------------------------
+# UTILITIES
+# --------------------------------------------------
+
+def estimate_salary(title):
+    title = title.lower()
+    if "senior" in title:
+        return "$90k – $130k"
+    if "machine learning" in title or "data" in title:
+        return "$80k – $120k"
+    if "backend" in title or "full stack" in title:
+        return "$70k – $110k"
+    return "$50k – $90k"
+
 
 def parse_resume(file):
     text = ""
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             if page.extract_text():
-                text += page.extract_text() + " "
+                text += page.extract_text().lower()
 
-    text_lower = text.lower()
-    skills = [s for s in COMMON_SKILLS if s in text_lower]
-
-    if not skills:
-        skills = ["developer", "engineer", "software"]
-
-
-    experience = re.findall(r'(\d+)\s+years?', text_lower)
-
-    doc = nlp(text)
-    locations = [ent.text for ent in doc.ents if ent.label_ == "GPE"]
+    skills = [s for s in COMMON_SKILLS if s in text]
+    exp = re.findall(r'(\d+)\s+years?', text)
 
     return {
-        "skills": list(set(skills)),
-        "experience": experience[0] if experience else "Not specified",
-        "location": locations[0] if locations else "Anywhere"
+        "skills": skills or ["developer"],
+        "experience": exp[0] if exp else "Not specified",
+        "location": "Anywhere"
     }
 
 
-def fetch_remotive_jobs(skills, limit=30):
-    url = "https://remotive.io/api/remote-jobs"
-
+@st.cache_data(ttl=600)
+def fetch_remotive_raw():
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code != 200:
-            return []
-        data = response.json()
+        res = requests.get("https://remotive.io/api/remote-jobs", timeout=10)
+        if res.status_code == 200:
+            return res.json().get("jobs", [])
     except Exception:
-        return []
+        pass
+    return []
 
-    jobs = []
-    for job in data.get("jobs", [])[:200]:
-        text = (job.get("title", "") + " " + job.get("description", "")).lower()
 
-        score = 0
-        for skill in skills:
-            if skill.lower() in text:
-                score += 1
+def semantic_match_jobs(skills, jobs, limit=30):
+    user_text = " ".join(skills)
+    job_texts = [
+        job.get("title", "") + " " + job.get("description", "")
+        for job in jobs
+    ]
 
-        jobs.append({
-            "title": job.get("title", "N/A"),
-            "company": job.get("company_name", "N/A"),
-            "location": job.get("candidate_required_location", "Remote"),
-            "url": job.get("url", "#"),
-            "source": "Remotive",
-            "match_score": score
+    vectorizer = TfidfVectorizer(stop_words="english")
+    vectors = vectorizer.fit_transform([user_text] + job_texts)
+    scores = cosine_similarity(vectors[0:1], vectors[1:]).flatten()
+
+    results = []
+    for job, score in zip(jobs, scores):
+        results.append({
+            "title": job["title"],
+            "company": job["company_name"],
+            "location": job["candidate_required_location"],
+            "url": job["url"],
+            "score": round(float(score), 2),
+            "salary": estimate_salary(job["title"])
         })
 
-    # sort by relevance
-    jobs = sorted(jobs, key=lambda x: x["match_score"], reverse=True)
-
-    # return top results even if score = 0
-    return jobs[:limit]
+    return sorted(results, key=lambda x: x["score"], reverse=True)[:limit]
 
 
-def generate_linkedin_url(skills, location):
-    query = urllib.parse.quote(" ".join(skills))
-    loc = urllib.parse.quote(location)
-    return f"https://www.linkedin.com/jobs/search/?keywords={query}&location={loc}"
+def linkedin_search(skills, location):
+    q = urllib.parse.quote(" ".join(skills))
+    l = urllib.parse.quote(location)
+    return f"https://www.linkedin.com/jobs/search/?keywords={q}&location={l}"
 
-# ---------------- UI ----------------
 
-st.title("🔍 Live AI Job Finder")
-st.caption("No login • No database • Real-time jobs")
+def indeed_search(skills, location):
+    q = urllib.parse.quote(" ".join(skills))
+    l = urllib.parse.quote(location)
+    return f"https://www.indeed.com/jobs?q={q}&l={l}"
 
-input_method = st.radio(
-    "How do you want to provide your information?",
-    ["Fill Form", "Upload Resume"]
-)
+# --------------------------------------------------
+# UI
+# --------------------------------------------------
+
+st.title("🔍 Enhanced Live Job Finder")
+st.caption("Semantic matching • No login • No database")
+
+method = st.radio("Input method", ["Manual Input", "Upload Resume"])
 
 skills = []
 location = "Anywhere"
 
-if input_method == "Fill Form":
-    skill_input = st.text_input("Skills (comma separated)", placeholder="python, react, fastapi")
-    location = st.text_input("Preferred Location", value="Anywhere")
-    skills = [s.strip().lower() for s in skill_input.split(",") if s.strip()]
-
+if method == "Manual Input":
+    skills = st.text_input("Skills (comma separated)").lower().split(",")
+    skills = [s.strip() for s in skills if s.strip()]
 else:
-    resume = st.file_uploader("Upload Resume (PDF only)", type=["pdf"])
+    resume = st.file_uploader("Upload Resume (PDF)", type=["pdf"])
     if resume:
         parsed = parse_resume(resume)
         skills = parsed["skills"]
         location = parsed["location"]
+        st.info(f"Extracted skills: {', '.join(skills)}")
 
-        st.subheader("📄 Extracted From Resume")
-        st.write("**Skills:**", ", ".join(skills))
-        st.write("**Experience:**", parsed["experience"], "years")
-        st.write("**Location:**", location)
+if not skills:
+    skills = ["developer"]
 
-# ---------------- SEARCH ----------------
+# Filters
+min_score = st.slider("Minimum relevance score", 0.0, 1.0, 0.1)
+keyword_filter = st.text_input("Must include keyword (optional)")
+
+# --------------------------------------------------
+# SEARCH
+# --------------------------------------------------
 
 if st.button("🚀 Find Jobs"):
-    if not skills:
-        st.warning("Please provide skills.")
-    else:
-        with st.spinner("Fetching live jobs..."):
-            jobs = fetch_remotive_jobs(skills)
-            linkedin_url = generate_linkedin_url(skills, location)
+    with st.spinner("Matching jobs intelligently..."):
+        raw_jobs = fetch_remotive_raw()
+        matched = semantic_match_jobs(skills, raw_jobs)
 
-        st.success(f"Found {len(jobs)} matching jobs")
+    st.success(f"Showing {len(matched)} jobs")
 
-        # ---------------- RESULTS ----------------
-        for job in jobs:
+    for job in matched:
+        if job["score"] < min_score:
+            continue
+        if keyword_filter and keyword_filter.lower() not in job["title"].lower():
+            continue
+
+        col1, col2 = st.columns([4, 1])
+
+        with col1:
             st.markdown(f"""
             ### {job['title']}
             **Company:** {job['company']}  
             **Location:** {job['location']}  
-            **Source:** {job['source']}  
-            **Match Score:** {job['match_score']}  
+            **Relevance Score:** {job['score']}  
+            **Estimated Salary:** {job['salary']}  
 
             👉 [Apply Here]({job['url']})
-            ---
             """)
 
-        # ---------------- LINKEDIN ----------------
-        st.subheader("🔗 Search More on LinkedIn")
-        st.markdown(f"[Open LinkedIn Job Search]({linkedin_url})")
+        with col2:
+            if st.button("⭐ Save", key=job["url"]):
+                st.session_state.bookmarks.append(job)
 
+        st.divider()
+
+    # External Platforms
+    st.subheader("🔗 Search More")
+    st.markdown(f"- [LinkedIn Jobs]({linkedin_search(skills, location)})")
+    st.markdown(f"- [Indeed Jobs]({indeed_search(skills, location)})")
+
+# --------------------------------------------------
+# BOOKMARKS
+# --------------------------------------------------
+
+if st.session_state.bookmarks:
+    st.subheader("⭐ Saved Jobs")
+    for job in st.session_state.bookmarks:
+        st.markdown(f"- **{job['title']}** at {job['company']}")
