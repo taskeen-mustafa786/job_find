@@ -5,6 +5,7 @@ import re
 import urllib.parse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 # --------------------------------------------------
 # CONFIG
@@ -23,15 +24,37 @@ if "bookmarks" not in st.session_state:
 # UTILITIES
 # --------------------------------------------------
 
-def estimate_salary(title):
-    title = title.lower()
-    if "senior" in title:
-        return "$90k – $130k"
-    if "machine learning" in title or "data" in title:
-        return "$80k – $120k"
-    if "backend" in title or "full stack" in title:
-        return "$70k – $110k"
-    return "$50k – $90k"
+
+SALARY_DATA = {
+    "junior software engineer": 60000,
+    "software engineer": 80000,
+    "senior software engineer": 110000,
+    "backend developer": 90000,
+    "full stack developer": 95000,
+    "machine learning engineer": 120000,
+    "data scientist": 115000,
+    "devops engineer": 105000,
+    "frontend developer": 85000,
+    "cloud architect": 130000
+}
+
+def ai_estimate_salary(job_title):
+    titles = list(SALARY_DATA.keys())
+    salaries = np.array(list(SALARY_DATA.values()))
+
+    vectorizer = TfidfVectorizer(stop_words="english")
+    vectors = vectorizer.fit_transform([job_title] + titles)
+
+    similarities = cosine_similarity(vectors[0:1], vectors[1:]).flatten()
+    best_match_idx = similarities.argmax()
+
+    estimated_salary = salaries[best_match_idx]
+
+    # Convert to range
+    low = int(estimated_salary * 0.85)
+    high = int(estimated_salary * 1.15)
+
+    return f"${low//1000}k – ${high//1000}k"
 
 
 def parse_resume(file):
@@ -81,7 +104,7 @@ def semantic_match_jobs(skills, jobs, limit=30):
             "location": job["candidate_required_location"],
             "url": job["url"],
             "score": round(float(score), 2),
-            "salary": estimate_salary(job["title"])
+            "salary": ai_estimate_salary(job["title"])
         })
 
     return sorted(results, key=lambda x: x["score"], reverse=True)[:limit]
